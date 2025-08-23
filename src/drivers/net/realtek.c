@@ -328,6 +328,127 @@ static struct mii_operations realtek_mii_operations = {
 
 /******************************************************************************
  *
+ * RTL8125 OCP register access
+ *
+ * These functions are based on the Linux r8169 driver's r8168_mac_ocp_read()
+ * and r8168_mac_ocp_write() functions, which properly handle the ERIAR register
+ * bit settings required for reliable OCP access across all RTL8125 revisions.
+ *
+ ******************************************************************************
+ */
+
+/**
+ * Read RTL8125 MAC OCP register (based on Linux r8168_mac_ocp_read)
+ *
+ * @v rtl		Realtek device
+ * @v addr		OCP register address
+ * @ret value		Register value
+ */
+static uint16_t realtek_ocp_read ( struct realtek_nic *rtl, uint16_t addr ) {
+	unsigned int i;
+	uint32_t eriar_value;
+
+	DBGC2 ( rtl, "REALTEK %p OCP read from address 0x%04x\n", rtl, addr );
+
+	/* Write address and read command to ERIAR - Linux r8169 format */
+	/* For read: set type and address, bit 31 = 0 initially */
+	eriar_value = RTL_ERIAR_MAC_OCP | ( addr & RTL_ERIAR_ADDR_MASK );
+	
+	DBGC2 ( rtl, "REALTEK %p OCP writing ERIAR=0x%08x for read\n", rtl, eriar_value );
+	writel ( eriar_value, rtl->regs + RTL_ERIAR );
+
+	/* Wait for completion - bit 31 becomes 1 when read is complete */
+	for ( i = 0 ; i < 2000 ; i++ ) {
+		eriar_value = readl ( rtl->regs + RTL_ERIAR );
+		if ( eriar_value & RTL_ERIAR_FLAG )
+			break;
+		udelay ( 1 );
+	}
+
+	if ( i >= 2000 ) {
+		DBGC ( rtl, "REALTEK %p OCP read timeout at address 0x%04x (ERIAR=0x%08x)\n", 
+		       rtl, addr, eriar_value );
+		return 0xffff;
+	}
+
+	/* Read result from ERIDR */
+	uint16_t result = ( readl ( rtl->regs + RTL_ERIDR ) & 0xffff );
+	DBGC2 ( rtl, "REALTEK %p OCP read completed: addr=0x%04x value=0x%04x (took %d iterations)\n", 
+	        rtl, addr, result, i );
+	return result;
+}
+
+/**
+ * Write RTL8125 MAC OCP register (based on Linux r8168_mac_ocp_write)
+ *
+ * @v rtl		Realtek device
+ * @v addr		OCP register address
+ * @v value		Register value
+ */
+static void realtek_ocp_write ( struct realtek_nic *rtl, uint16_t addr, uint16_t value ) {
+	unsigned int i;
+	uint32_t eriar_value;
+
+	DBGC2 ( rtl, "REALTEK %p OCP write to address 0x%04x value 0x%04x\n", rtl, addr, value );
+
+	/* Write value to ERIDR first */
+	writel ( value, rtl->regs + RTL_ERIDR );
+	
+	/* Write address and write command to ERIAR - Linux r8169 format */
+	/* For write: set type, address, and bit 31 = 1 */
+	eriar_value = RTL_ERIAR_WRITE | RTL_ERIAR_MAC_OCP | 
+		      ( addr & RTL_ERIAR_ADDR_MASK );
+	
+	DBGC2 ( rtl, "REALTEK %p OCP writing ERIAR=0x%08x for write\n", rtl, eriar_value );
+	writel ( eriar_value, rtl->regs + RTL_ERIAR );
+
+	/* Wait for completion - bit 31 becomes 0 when write is complete */
+	for ( i = 0 ; i < 2000 ; i++ ) {
+		eriar_value = readl ( rtl->regs + RTL_ERIAR );
+		if ( ! ( eriar_value & RTL_ERIAR_FLAG ) )
+			break;
+		udelay ( 1 );
+	}
+
+	if ( i >= 2000 ) {
+		DBGC ( rtl, "REALTEK %p OCP write timeout at address 0x%04x (ERIAR=0x%08x)\n", 
+		       rtl, addr, eriar_value );
+	} else {
+		DBGC2 ( rtl, "REALTEK %p OCP write completed: addr=0x%04x value=0x%04x (took %d iterations)\n", 
+		        rtl, addr, value, i );
+	}
+}
+
+/**
+ * Disable RTL8125 new TX descriptor format
+ *
+ * @v rtl		Realtek device
+ */
+static void realtek_disable_new_desc ( struct realtek_nic *rtl ) {
+	uint16_t val;
+
+	DBGC ( rtl, "REALTEK %p disabling RTL8125 new TX descriptor format\n", rtl );
+	
+	/* Read current value of OCP register 0xeb58 */
+	val = realtek_ocp_read ( rtl, 0xeb58 );
+	DBGC ( rtl, "REALTEK %p OCP 0xeb58 original value: 0x%04x\n", rtl, val );
+	
+	/* Clear bit 0 to disable new descriptor format */
+	val &= ~0x0001;
+	DBGC ( rtl, "REALTEK %p OCP 0xeb58 modified value: 0x%04x\n", rtl, val );
+	
+	/* Write back the modified value */
+	realtek_ocp_write ( rtl, 0xeb58, val );
+	
+	/* Verify the write */
+	uint16_t verify = realtek_ocp_read ( rtl, 0xeb58 );
+	DBGC ( rtl, "REALTEK %p OCP 0xeb58 verification read: 0x%04x\n", rtl, verify );
+	
+	DBGC ( rtl, "REALTEK %p RTL8125 new descriptor format disabled\n", rtl );
+}
+
+/******************************************************************************
+ *
  * Device reset
  *
  ******************************************************************************
@@ -337,16 +458,27 @@ static struct mii_operations realtek_mii_operations = {
  * Reset hardware
  *
  * @v rtl		Realtek device
+ * @v pci		PCI device (for device-specific handling)
  * @ret rc		Return status code
  */
-static int realtek_reset ( struct realtek_nic *rtl ) {
+static int realtek_reset ( struct realtek_nic *rtl, struct pci_device *pci ) {
 	unsigned int i;
+	unsigned int max_wait = RTL_RESET_MAX_WAIT_MS;
+
+	DBGC ( rtl, "REALTEK %p starting device reset\n", rtl );
+
+	/* RTL8125 family may need longer reset time */
+	if ( pci && RTL_IS_8125_FAMILY ( pci->vendor, pci->device ) ) {
+		max_wait = RTL_RESET_MAX_WAIT_MS * 2;
+		DBGC ( rtl, "REALTEK %p RTL8125 family using extended reset timeout (%dms)\n", rtl, max_wait );
+	}
 
 	/* Issue reset */
+	DBGC ( rtl, "REALTEK %p issuing reset command\n", rtl );
 	writeb ( RTL_CR_RST, rtl->regs + RTL_CR );
 
 	/* Wait for reset to complete */
-	for ( i = 0 ; i < RTL_RESET_MAX_WAIT_MS ; i++ ) {
+	for ( i = 0 ; i < max_wait ; i++ ) {
 
 		/* If reset is not complete, delay 1ms and retry */
 		if ( readb ( rtl->regs + RTL_CR ) & RTL_CR_RST ) {
@@ -354,10 +486,20 @@ static int realtek_reset ( struct realtek_nic *rtl ) {
 			continue;
 		}
 
+		DBGC ( rtl, "REALTEK %p reset completed after %dms\n", rtl, i );
+
+		/* RTL8125 family specific post-reset initialization */
+		if ( pci && RTL_IS_8125_FAMILY ( pci->vendor, pci->device ) ) {
+			DBGC ( rtl, "REALTEK %p RTL8125 family post-reset settling delay\n", rtl );
+			/* Additional settling time for RTL8125 family */
+			mdelay ( 10 );
+		}
+
+		DBGC ( rtl, "REALTEK %p reset successful\n", rtl );
 		return 0;
 	}
 
-	DBGC ( rtl, "REALTEK %p timed out waiting for reset\n", rtl );
+	DBGC ( rtl, "REALTEK %p timed out waiting for reset (waited %dms)\n", rtl, max_wait );
 	return -ETIMEDOUT;
 }
 
@@ -457,6 +599,8 @@ static void realtek_check_link ( struct net_device *netdev ) {
 	uint8_t phystatus;
 	uint8_t msr;
 	int link_up;
+
+	DBGC2 ( rtl, "REALTEK %p checking link state\n", rtl );
 
 	/* Determine link state */
 	if ( rtl->have_phy_regs ) {
@@ -765,7 +909,7 @@ static void realtek_close ( struct net_device *netdev ) {
 
 	/* Reset legacy transmit descriptor index, if applicable */
 	if ( rtl->legacy )
-		realtek_reset ( rtl );
+		realtek_reset ( rtl, NULL );
 }
 
 /**
@@ -781,7 +925,6 @@ static int realtek_transmit ( struct net_device *netdev,
 	struct realtek_descriptor *tx;
 	unsigned int tx_idx;
 	int is_last;
-	int rc;
 
 	/* Get next transmit descriptor */
 	if ( ( rtl->tx.prod - rtl->tx.cons ) >= RTL_NUM_TX_DESC ) {
@@ -790,13 +933,12 @@ static int realtek_transmit ( struct net_device *netdev,
 	}
 	tx_idx = ( rtl->tx.prod % RTL_NUM_TX_DESC );
 
+	DBGC2 ( rtl, "REALTEK %p transmit packet %d length %zd\n", 
+	        rtl, tx_idx, iob_len ( iobuf ) );
+
 	/* Pad and align packet, if needed */
 	if ( rtl->legacy )
 		iob_pad ( iobuf, ETH_ZLEN );
-
-	/* Map I/O buffer */
-	if ( ( rc = iob_map_tx ( iobuf, rtl->dma ) ) != 0 )
-		return rc;
 
 	/* Update producer index */
 	rtl->tx.prod++;
@@ -804,6 +946,8 @@ static int realtek_transmit ( struct net_device *netdev,
 	/* Transmit packet */
 	if ( rtl->legacy ) {
 
+		DBGC2 ( rtl, "REALTEK %p legacy transmit: idx=%d addr=0x%08lx len=%zd\n",
+		        rtl, tx_idx, iob_dma ( iobuf ), iob_len ( iobuf ) );
 		/* Add to transmit ring */
 		writel ( iob_dma ( iobuf ), rtl->regs + RTL_TSAD ( tx_idx ) );
 		writel ( ( RTL_TSD_ERTXTH_DEFAULT | iob_len ( iobuf ) ),
@@ -822,8 +966,20 @@ static int realtek_transmit ( struct net_device *netdev,
 			      ( is_last ? cpu_to_le16 ( RTL_DESC_EOR ) : 0 ) );
 		wmb();
 
+		DBGC2 ( rtl, "REALTEK %p descriptor transmit: idx=%d addr=0x%016llx len=%d flags=0x%04x\n",
+		        rtl, tx_idx, (unsigned long long)le64_to_cpu(tx->address), 
+		        le16_to_cpu(tx->length), le16_to_cpu(tx->flags) );
+
 		/* Notify card that there are packets ready to transmit */
-		writeb ( RTL_TPPOLL_NPQ, rtl->regs + rtl->tppoll );
+		if ( rtl->use_8125 ) {
+			DBGC2 ( rtl, "REALTEK %p RTL8125 doorbell: writing 0x0001 to 0x%02x\n", 
+			        rtl, RTL_8125_TPPOLL );
+			writew ( 0x0001, rtl->regs + RTL_8125_TPPOLL );
+		} else {
+			DBGC2 ( rtl, "REALTEK %p legacy doorbell: writing 0x%02x to 0x%02x\n", 
+			        rtl, RTL_TPPOLL_NPQ, rtl->tppoll );
+			writeb ( RTL_TPPOLL_NPQ, rtl->regs + rtl->tppoll );
+		}
 	}
 
 	DBGC2 ( rtl, "REALTEK %p TX %d is [%lx,%lx)\n",
@@ -853,9 +1009,11 @@ static void realtek_poll_tx ( struct net_device *netdev ) {
 		if ( rtl->legacy ) {
 
 			/* Check ownership bit in transmit status register */
-			if ( ! ( readl ( rtl->regs + RTL_TSD ( tx_idx ) ) &
-				 RTL_TSD_OWN ) )
+			uint32_t tsd = readl ( rtl->regs + RTL_TSD ( tx_idx ) );
+			if ( ! ( tsd & RTL_TSD_OWN ) )
 				return;
+			DBGC2 ( rtl, "REALTEK %p legacy TX %d completed (TSD=0x%08x)\n", 
+			        rtl, tx_idx, tsd );
 
 		} else {
 
@@ -863,6 +1021,8 @@ static void realtek_poll_tx ( struct net_device *netdev ) {
 			tx = &rtl->tx.desc[tx_idx];
 			if ( tx->flags & cpu_to_le16 ( RTL_DESC_OWN ) )
 				return;
+			DBGC2 ( rtl, "REALTEK %p descriptor TX %d completed (flags=0x%04x)\n", 
+			        rtl, tx_idx, le16_to_cpu(tx->flags) );
 		}
 
 		DBGC2 ( rtl, "REALTEK %p TX %d complete\n", rtl, tx_idx );
@@ -986,25 +1146,49 @@ static void realtek_poll_rx ( struct net_device *netdev ) {
  */
 static void realtek_poll ( struct net_device *netdev ) {
 	struct realtek_nic *rtl = netdev->priv;
+	uint32_t isr32;
 	uint16_t isr;
 
-	/* Check for and acknowledge interrupts */
-	isr = readw ( rtl->regs + RTL_ISR );
-	if ( ! isr )
-		return;
-	writew ( isr, rtl->regs + RTL_ISR );
+	if ( rtl->use_8125 ) {
+		/* RTL8125 uses 32-bit ISR */
+		isr32 = readl ( rtl->regs + RTL_8125_ISR );
+		if ( ! isr32 )
+			return;
+		writel ( isr32, rtl->regs + RTL_8125_ISR );
+		
+		DBGC2 ( rtl, "REALTEK %p RTL8125 ISR: 0x%08x\n", rtl, isr32 );
+		
+		/* Extract relevant interrupt bits (low 16 bits match old layout) */
+		isr = (uint16_t)( isr32 & 0xffff );
+	} else {
+		/* Traditional chips use 16-bit ISR */
+		isr = readw ( rtl->regs + RTL_ISR );
+		if ( ! isr )
+			return;
+		writew ( isr, rtl->regs + RTL_ISR );
+		
+		DBGC2 ( rtl, "REALTEK %p legacy ISR: 0x%04x\n", rtl, isr );
+	}
 
 	/* Poll for TX completions, if applicable */
-	if ( isr & ( RTL_IRQ_TER | RTL_IRQ_TOK ) )
+	if ( isr & ( RTL_IRQ_TER | RTL_IRQ_TOK ) ) {
+		DBGC2 ( rtl, "REALTEK %p TX interrupt (TER=%d TOK=%d)\n", 
+		        rtl, !!(isr & RTL_IRQ_TER), !!(isr & RTL_IRQ_TOK) );
 		realtek_poll_tx ( netdev );
+	}
 
 	/* Poll for RX completionsm, if applicable */
-	if ( isr & ( RTL_IRQ_RER | RTL_IRQ_ROK ) )
+	if ( isr & ( RTL_IRQ_RER | RTL_IRQ_ROK ) ) {
+		DBGC2 ( rtl, "REALTEK %p RX interrupt (RER=%d ROK=%d)\n", 
+		        rtl, !!(isr & RTL_IRQ_RER), !!(isr & RTL_IRQ_ROK) );
 		realtek_poll_rx ( netdev );
+	}
 
 	/* Check link state, if applicable */
-	if ( isr & RTL_IRQ_PUN_LINKCHG )
+	if ( isr & RTL_IRQ_PUN_LINKCHG ) {
+		DBGC2 ( rtl, "REALTEK %p link change interrupt\n", rtl );
 		realtek_check_link ( netdev );
+	}
 
 	/* Refill RX ring */
 	realtek_refill_rx ( rtl );
@@ -1018,12 +1202,17 @@ static void realtek_poll ( struct net_device *netdev ) {
  */
 static void realtek_irq ( struct net_device *netdev, int enable ) {
 	struct realtek_nic *rtl = netdev->priv;
-	uint16_t imr;
+	uint32_t mask;
 
 	/* Set interrupt mask */
-	imr = ( enable ? ( RTL_IRQ_PUN_LINKCHG | RTL_IRQ_TER | RTL_IRQ_TOK |
-			   RTL_IRQ_RER | RTL_IRQ_ROK ) : 0 );
-	writew ( imr, rtl->regs + RTL_IMR );
+	mask = ( enable ? ( RTL_IRQ_PUN_LINKCHG | RTL_IRQ_TER | RTL_IRQ_TOK |
+			    RTL_IRQ_RER | RTL_IRQ_ROK ) : 0 );
+
+	if ( rtl->use_8125 ) {
+		writel ( mask, rtl->regs + RTL_8125_IMR );
+	} else {
+		writew ( (uint16_t)mask, rtl->regs + RTL_IMR );
+	}
 }
 
 /** Realtek network device operations */
@@ -1046,19 +1235,41 @@ static struct net_device_operations realtek_operations = {
  * Detect device type
  *
  * @v rtl		Realtek device
+ * @v pci		PCI device
  */
-static void realtek_detect ( struct realtek_nic *rtl ) {
+static void realtek_detect ( struct realtek_nic *rtl, struct pci_device *pci ) {
 	uint16_t rms;
 	uint16_t check_rms;
 	uint16_t cpcr;
 	uint16_t check_cpcr;
 
+	/* Check for RTL8125 family by PCI device ID */
+	DBGC ( rtl, "REALTEK %p PCI device detection: vendor=0x%04x device=0x%04x\n", 
+	       rtl, pci->vendor, pci->device );
+	if ( RTL_IS_8125_FAMILY ( pci->vendor, pci->device ) ) {
+		DBGC ( rtl, "REALTEK %p appears to be an RTL8125 family device (ID=0x%04x)\n", rtl, pci->device );
+		DBGC ( rtl, "REALTEK %p RTL8125 configuration: use_8125=1, have_phy_regs=1, tppoll=0x%02x\n", 
+		       rtl, RTL_8125_TPPOLL );
+		rtl->use_8125 = 1;
+		rtl->have_phy_regs = 1;
+		rtl->tppoll = RTL_8125_TPPOLL;
+		rtl->eeprom.bus = &rtl->spibit.bus;
+		DBGC ( rtl, "REALTEK %p RTL8125 family device detection completed\n", rtl );
+		return;
+	}
+
+	/* Default to non-8125 mode */
+	DBGC ( rtl, "REALTEK %p not RTL8125 family, proceeding with legacy detection\n", rtl );
+	rtl->use_8125 = 0;
+
 	/* The RX Packet Maximum Size register is present only on
 	 * 8169.  Try to set to our intended MTU.
 	 */
+	DBGC ( rtl, "REALTEK %p testing RMS register for 8169 detection\n", rtl );
 	rms = RTL_RX_MAX_LEN;
 	writew ( rms, rtl->regs + RTL_RMS );
 	check_rms = readw ( rtl->regs + RTL_RMS );
+	DBGC ( rtl, "REALTEK %p RMS test: wrote=0x%04x read=0x%04x\n", rtl, rms, check_rms );
 
 	/* The C+ Command register is present only on 8169 and 8139C+.
 	 * Try to enable C+ mode and PCI Dual Address Cycle (for
@@ -1071,29 +1282,37 @@ static void realtek_detect ( struct realtek_nic *rtl ) {
 	 * Disable VLAN offload, since some cards seem to have it
 	 * enabled by default.
 	 */
+	DBGC ( rtl, "REALTEK %p testing C+ Command register for 8169/8139C+ detection\n", rtl );
 	cpcr = readw ( rtl->regs + RTL_CPCR );
+	DBGC ( rtl, "REALTEK %p C+ Command original value: 0x%04x\n", rtl, cpcr );
 	cpcr |= ( RTL_CPCR_MULRW | RTL_CPCR_CPRX | RTL_CPCR_CPTX );
 	if ( sizeof ( physaddr_t ) > sizeof ( uint32_t ) )
 		cpcr |= RTL_CPCR_DAC;
 	cpcr &= ~RTL_CPCR_VLAN;
+	DBGC ( rtl, "REALTEK %p C+ Command writing value: 0x%04x\n", rtl, cpcr );
 	writew ( cpcr, rtl->regs + RTL_CPCR );
 	check_cpcr = readw ( rtl->regs + RTL_CPCR );
+	DBGC ( rtl, "REALTEK %p C+ Command readback value: 0x%04x\n", rtl, check_cpcr );
 
 	/* Detect device type */
+	DBGC ( rtl, "REALTEK %p device type detection starting\n", rtl );
 	if ( check_rms == rms ) {
 		DBGC ( rtl, "REALTEK %p appears to be an RTL8169\n", rtl );
+		DBGC ( rtl, "REALTEK %p RTL8169 configuration: have_phy_regs=1, tppoll=0x%02x\n", 
+		       rtl, RTL_TPPOLL );
 		rtl->have_phy_regs = 1;
-		rtl->tppoll = RTL_TPPOLL_8169;
-		dma_set_mask_64bit ( rtl->dma );
+		rtl->tppoll = RTL_TPPOLL;
 	} else {
 		if ( ( check_cpcr == cpcr ) && ( cpcr != 0xffff ) ) {
 			DBGC ( rtl, "REALTEK %p appears to be an RTL8139C+\n",
 			       rtl );
+			DBGC ( rtl, "REALTEK %p RTL8139C+ configuration: tppoll=0x%02x\n", 
+			       rtl, RTL_TPPOLL_8139CP );
 			rtl->tppoll = RTL_TPPOLL_8139CP;
-			dma_set_mask_64bit ( rtl->dma );
 		} else {
 			DBGC ( rtl, "REALTEK %p appears to be an RTL8139\n",
 			       rtl );
+			DBGC ( rtl, "REALTEK %p RTL8139 configuration: legacy=1\n", rtl );
 			rtl->legacy = 1;
 		}
 		rtl->eeprom.bus = &rtl->spibit.bus;
@@ -1112,10 +1331,13 @@ static int realtek_probe ( struct pci_device *pci ) {
 	unsigned int i;
 	int rc;
 
+	DBGC ( NULL, "REALTEK probing PCI device %04x:%04x\n", pci->vendor, pci->device );
+
 	/* Allocate and initialise net device */
 	netdev = alloc_etherdev ( sizeof ( *rtl ) );
 	if ( ! netdev ) {
 		rc = -ENOMEM;
+		DBGC ( NULL, "REALTEK failed to allocate network device\n" );
 		goto err_alloc;
 	}
 	netdev_init ( netdev, &realtek_operations );
@@ -1126,25 +1348,44 @@ static int realtek_probe ( struct pci_device *pci ) {
 	realtek_init_ring ( &rtl->tx, RTL_NUM_TX_DESC, RTL_TNPDS );
 	realtek_init_ring ( &rtl->rx, RTL_NUM_RX_DESC, RTL_RDSAR );
 
+	DBGC ( rtl, "REALTEK %p allocated and initialized\n", rtl );
+
 	/* Fix up PCI device */
 	adjust_pci_device ( pci );
+	DBGC ( rtl, "REALTEK %p PCI device adjusted\n", rtl );
 
 	/* Map registers */
-	rtl->regs = pci_ioremap ( pci, pci->membase, RTL_BAR_SIZE );
+	size_t bar_size = RTL_BAR_SIZE;
+	if ( RTL_IS_8125_FAMILY ( pci->vendor, pci->device ) ) {
+		/* RTL8125 family - use larger BAR size (4KB to match Linux driver) */
+		bar_size = RTL_BAR_SIZE_RTL8125;
+	}
+	DBGC ( rtl, "REALTEK %p mapping BAR of size 0x%zx at address 0x%08lx\n", 
+	       rtl, bar_size, pci->membase );
+	rtl->regs = pci_ioremap ( pci, pci->membase, bar_size );
 	if ( ! rtl->regs ) {
+		DBGC ( rtl, "REALTEK %p failed to map PCI BAR\n", rtl );
 		rc = -ENODEV;
 		goto err_ioremap;
 	}
+	DBGC ( rtl, "REALTEK %p registers mapped to %p\n", rtl, rtl->regs );
 
 	/* Configure DMA */
 	rtl->dma = &pci->dma;
+	DBGC ( rtl, "REALTEK %p DMA device configured\n", rtl );
 
 	/* Reset the NIC */
-	if ( ( rc = realtek_reset ( rtl ) ) != 0 )
+	if ( ( rc = realtek_reset ( rtl, pci ) ) != 0 )
 		goto err_reset;
 
 	/* Detect device type */
-	realtek_detect ( rtl );
+	realtek_detect ( rtl, pci );
+
+	/* Disable new TX descriptor format for RTL8125 */
+	if ( rtl->use_8125 ) {
+		DBGC ( rtl, "REALTEK %p RTL8125 family detected, disabling new descriptor format\n", rtl );
+		realtek_disable_new_desc ( rtl );
+	}
 
 	/* Initialise EEPROM */
 	if ( rtl->eeprom.bus &&
@@ -1164,17 +1405,23 @@ static int realtek_probe ( struct pci_device *pci ) {
 		 * current ID register value, which will hopefully
 		 * have been programmed by the platform firmware.
 		 */
+		DBGC ( rtl, "REALTEK %p EEPROM not present, reading MAC from ID registers\n", rtl );
 		for ( i = 0 ; i < ETH_ALEN ; i++ )
 			netdev->hw_addr[i] = readb ( rtl->regs + RTL_IDR0 + i );
+		DBGC ( rtl, "REALTEK %p MAC address from registers: %s\n", 
+		       rtl, eth_ntoa ( netdev->hw_addr ) );
 	}
 
 	/* Initialise and reset MII interface */
+	DBGC ( rtl, "REALTEK %p initializing MII interface\n", rtl );
 	mdio_init ( &rtl->mdio, &realtek_mii_operations );
 	mii_init ( &rtl->mii, &rtl->mdio, 0 );
 	if ( ( rc = realtek_phy_reset ( rtl ) ) != 0 )
 		goto err_phy_reset;
 
 	/* Register network device */
+	DBGC ( rtl, "REALTEK %p registering network device with MAC %s\n", 
+	       rtl, eth_ntoa ( netdev->hw_addr ) );
 	if ( ( rc = register_netdev ( netdev ) ) != 0 )
 		goto err_register_netdev;
 
@@ -1183,10 +1430,13 @@ static int realtek_probe ( struct pci_device *pci ) {
 
 	/* Register non-volatile options, if applicable */
 	if ( rtl->nvo.nvs ) {
+		DBGC ( rtl, "REALTEK %p registering non-volatile options\n", rtl );
 		if ( ( rc = register_nvo ( &rtl->nvo,
 					   netdev_settings ( netdev ) ) ) != 0)
 			goto err_register_nvo;
 	}
+
+	DBGC ( rtl, "REALTEK %p probe completed successfully\n", rtl );
 
 	return 0;
 
@@ -1195,7 +1445,7 @@ static int realtek_probe ( struct pci_device *pci ) {
  err_register_netdev:
  err_phy_reset:
  err_nvs_read:
-	realtek_reset ( rtl );
+	realtek_reset ( rtl, pci );
  err_reset:
 	iounmap ( rtl->regs );
  err_ioremap:
@@ -1222,7 +1472,7 @@ static void realtek_remove ( struct pci_device *pci ) {
 	unregister_netdev ( netdev );
 
 	/* Reset card */
-	realtek_reset ( rtl );
+	realtek_reset ( rtl, pci );
 
 	/* Free network device */
 	iounmap ( rtl->regs );
@@ -1237,6 +1487,7 @@ static struct pci_device_id realtek_nics[] = {
 	PCI_ROM ( 0x021b, 0x8139, "hne300",	"Compaq HNE-300", 0 ),
 	PCI_ROM ( 0x02ac, 0x1012, "s1012",	"SpeedStream 1012", 0 ),
 	PCI_ROM ( 0x0357, 0x000a, "ttpmon",	"TTTech TTP-Monitoring", 0 ),
+	PCI_ROM ( 0x10ec, 0x8125, "rtl8125",	"RTL-8125", 0 ),
 	PCI_ROM ( 0x10ec, 0x8129, "rtl8129",	"RTL-8129", 0 ),
 	PCI_ROM ( 0x10ec, 0x8136, "rtl8136",	"RTL8101E/RTL8102E", 0 ),
 	PCI_ROM ( 0x10ec, 0x8138, "rtl8138",	"RT8139 (B/C)", 0 ),
