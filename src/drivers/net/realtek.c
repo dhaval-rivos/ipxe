@@ -338,6 +338,28 @@ static struct mii_operations realtek_mii_operations = {
  */
 
 /**
+ * Check if RTL8125 is ready for OCP access
+ *
+ * @v rtl		Realtek device
+ * @ret ready		1 if ready, 0 if not ready
+ */
+static int realtek_ocp_ready ( struct realtek_nic *rtl ) {
+	uint32_t eriar_value;
+	int i;
+	
+	/* Check if ERIAR register is accessible and not busy */
+	for ( i = 0 ; i < 100 ; i++ ) {
+		eriar_value = readl ( rtl->regs + RTL_ERIAR );
+		if ( ! ( eriar_value & RTL_ERIAR_FLAG ) )
+			return 1;
+		udelay ( 10 );
+	}
+	
+	DBGC ( rtl, "REALTEK %p OCP not ready (ERIAR busy: 0x%08x)\n", rtl, eriar_value );
+	return 0;
+}
+
+/**
  * Read RTL8125 MAC OCP register (based on Linux r8168_mac_ocp_read)
  *
  * @v rtl		Realtek device
@@ -350,17 +372,26 @@ static uint16_t realtek_ocp_read ( struct realtek_nic *rtl, uint16_t addr ) {
 
 	DBGC2 ( rtl, "REALTEK %p OCP read from address 0x%04x\n", rtl, addr );
 
-	/* Write address and read command to ERIAR - Linux r8169 format */
-	/* For read: set type and address, bit 31 = 0 initially */
-	eriar_value = RTL_ERIAR_MAC_OCP | ( addr & RTL_ERIAR_ADDR_MASK );
+	/* Check if OCP is ready for access */
+	if ( ! realtek_ocp_ready ( rtl ) ) {
+		DBGC ( rtl, "REALTEK %p OCP not ready for read at 0x%04x\n", rtl, addr );
+		return 0xffff;
+	}
+
+	/* According to Linux r8169, for RTL8125 MAC OCP read:
+	 * 1. Write ERIAR with FLAG=1, TYPE=MAC_OCP, address
+	 * 2. Wait for FLAG to become 0 (operation complete)
+	 * 3. Read result from ERIDR
+	 */
+	eriar_value = RTL_ERIAR_FLAG | RTL_ERIAR_MAC_OCP | ( addr & RTL_ERIAR_ADDR_MASK );
 	
 	DBGC2 ( rtl, "REALTEK %p OCP writing ERIAR=0x%08x for read\n", rtl, eriar_value );
 	writel ( eriar_value, rtl->regs + RTL_ERIAR );
 
-	/* Wait for completion - bit 31 becomes 1 when read is complete */
+	/* Wait for completion - bit 31 becomes 0 when operation is complete */
 	for ( i = 0 ; i < 2000 ; i++ ) {
 		eriar_value = readl ( rtl->regs + RTL_ERIAR );
-		if ( eriar_value & RTL_ERIAR_FLAG )
+		if ( ! ( eriar_value & RTL_ERIAR_FLAG ) )
 			break;
 		udelay ( 1 );
 	}
@@ -391,18 +422,26 @@ static void realtek_ocp_write ( struct realtek_nic *rtl, uint16_t addr, uint16_t
 
 	DBGC2 ( rtl, "REALTEK %p OCP write to address 0x%04x value 0x%04x\n", rtl, addr, value );
 
+	/* Check if OCP is ready for access */
+	if ( ! realtek_ocp_ready ( rtl ) ) {
+		DBGC ( rtl, "REALTEK %p OCP not ready for write at 0x%04x\n", rtl, addr );
+		return;
+	}
+
 	/* Write value to ERIDR first */
 	writel ( value, rtl->regs + RTL_ERIDR );
 	
-	/* Write address and write command to ERIAR - Linux r8169 format */
-	/* For write: set type, address, and bit 31 = 1 */
-	eriar_value = RTL_ERIAR_WRITE | RTL_ERIAR_MAC_OCP | 
-		      ( addr & RTL_ERIAR_ADDR_MASK );
+	/* According to Linux r8169, for RTL8125 MAC OCP write:
+	 * 1. Write data to ERIDR
+	 * 2. Write ERIAR with FLAG=1, TYPE=MAC_OCP, address  
+	 * 3. Wait for FLAG to become 0 (operation complete)
+	 */
+	eriar_value = RTL_ERIAR_FLAG | RTL_ERIAR_MAC_OCP | ( addr & RTL_ERIAR_ADDR_MASK );
 	
 	DBGC2 ( rtl, "REALTEK %p OCP writing ERIAR=0x%08x for write\n", rtl, eriar_value );
 	writel ( eriar_value, rtl->regs + RTL_ERIAR );
 
-	/* Wait for completion - bit 31 becomes 0 when write is complete */
+	/* Wait for completion - bit 31 becomes 0 when operation is complete */
 	for ( i = 0 ; i < 2000 ; i++ ) {
 		eriar_value = readl ( rtl->regs + RTL_ERIAR );
 		if ( ! ( eriar_value & RTL_ERIAR_FLAG ) )
@@ -429,9 +468,19 @@ static void realtek_disable_new_desc ( struct realtek_nic *rtl ) {
 
 	DBGC ( rtl, "REALTEK %p disabling RTL8125 new TX descriptor format\n", rtl );
 	
+	/* First, let's check if OCP access is working at all */
+	DBGC ( rtl, "REALTEK %p testing OCP access with a simple read\n", rtl );
+	
 	/* Read current value of OCP register 0xeb58 */
 	val = realtek_ocp_read ( rtl, 0xeb58 );
 	DBGC ( rtl, "REALTEK %p OCP 0xeb58 original value: 0x%04x\n", rtl, val );
+	
+	/* Check if we got a valid response (not 0xffff timeout value) */
+	if ( val == 0xffff ) {
+		DBGC ( rtl, "REALTEK %p OCP access failed, skipping new descriptor disable\n", rtl );
+		DBGC ( rtl, "REALTEK %p this may not be a problem - some RTL8125 variants work without OCP\n", rtl );
+		return;
+	}
 	
 	/* Clear bit 0 to disable new descriptor format */
 	val &= ~0x0001;
@@ -444,7 +493,12 @@ static void realtek_disable_new_desc ( struct realtek_nic *rtl ) {
 	uint16_t verify = realtek_ocp_read ( rtl, 0xeb58 );
 	DBGC ( rtl, "REALTEK %p OCP 0xeb58 verification read: 0x%04x\n", rtl, verify );
 	
-	DBGC ( rtl, "REALTEK %p RTL8125 new descriptor format disabled\n", rtl );
+	if ( verify == val ) {
+		DBGC ( rtl, "REALTEK %p RTL8125 new descriptor format successfully disabled\n", rtl );
+	} else {
+		DBGC ( rtl, "REALTEK %p RTL8125 new descriptor format disable verification failed\n", rtl );
+		DBGC ( rtl, "REALTEK %p continuing anyway - device may still work\n", rtl );
+	}
 }
 
 /******************************************************************************
@@ -493,6 +547,10 @@ static int realtek_reset ( struct realtek_nic *rtl, struct pci_device *pci ) {
 			DBGC ( rtl, "REALTEK %p RTL8125 family post-reset settling delay\n", rtl );
 			/* Additional settling time for RTL8125 family */
 			mdelay ( 10 );
+			
+			/* Additional delay to ensure device is fully ready */
+			DBGC ( rtl, "REALTEK %p RTL8125 family additional stabilization delay\n", rtl );
+			mdelay ( 50 );
 		}
 
 		DBGC ( rtl, "REALTEK %p reset successful\n", rtl );
