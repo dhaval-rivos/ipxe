@@ -884,6 +884,9 @@ static int realtek_open ( struct net_device *netdev ) {
 	uint32_t rcr;
 	int rc;
 
+	DBGC ( rtl, "REALTEK %p opening with MAC address: %s\n", 
+	       rtl, eth_ntoa ( netdev->hw_addr ) );
+
 	/* Create transmit descriptor ring */
 	if ( ( rc = realtek_create_ring ( rtl, &rtl->tx ) ) != 0 )
 		goto err_create_tx;
@@ -895,6 +898,22 @@ static int realtek_open ( struct net_device *netdev ) {
 	/* Create receive buffer */
 	if ( ( rc = realtek_create_buffer ( rtl ) ) != 0 )
 		goto err_create_buffer;
+
+	/* Program MAC address into hardware registers */
+	DBGC ( rtl, "REALTEK %p programming MAC address: %s\n", 
+	       rtl, eth_ntoa ( netdev->hw_addr ) );
+	for ( unsigned int i = 0 ; i < ETH_ALEN ; i++ ) {
+		writeb ( netdev->hw_addr[i], rtl->regs + RTL_IDR0 + i );
+	}
+	
+	/* Read back and verify MAC address */
+	DBGC ( rtl, "REALTEK %p verifying MAC address in hardware:\n", rtl );
+	for ( unsigned int i = 0 ; i < ETH_ALEN ; i++ ) {
+		uint8_t hw_byte = readb ( rtl->regs + RTL_IDR0 + i );
+		DBGC ( rtl, "REALTEK %p   IDR%d: wrote %02x, read %02x %s\n", 
+		       rtl, i, netdev->hw_addr[i], hw_byte,
+		       (hw_byte == netdev->hw_addr[i]) ? "OK" : "MISMATCH!" );
+	}
 
 	/* Accept all packets */
 	writel ( 0xffffffffUL, rtl->regs + RTL_MAR0 );
@@ -1189,8 +1208,19 @@ static void realtek_poll_rx ( struct net_device *netdev ) {
 			       le16_to_cpu ( rx->flags ) );
 			netdev_rx_err ( netdev, iobuf, -EIO );
 		} else {
+			uint8_t *packet = ( uint8_t * ) iobuf->data;
 			DBGC2 ( rtl, "REALTEK %p RX %d complete (length "
 				"%zd)\n", rtl, rx_idx, len );
+			DBGC2 ( rtl, "REALTEK %p RX packet dest: %02x:%02x:%02x:%02x:%02x:%02x\n",
+				rtl, packet[0], packet[1], packet[2],
+				packet[3], packet[4], packet[5] );
+			DBGC2 ( rtl, "REALTEK %p RX packet src:  %02x:%02x:%02x:%02x:%02x:%02x\n",
+				rtl, packet[6], packet[7], packet[8],
+				packet[9], packet[10], packet[11] );
+			if ( len >= 14 ) {
+				uint16_t ethertype = ( packet[12] << 8 ) | packet[13];
+				DBGC2 ( rtl, "REALTEK %p RX packet ethertype: 0x%04x\n", rtl, ethertype );
+			}
 			netdev_rx ( netdev, iobuf );
 		}
 		rtl->rx.cons++;
