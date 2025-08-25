@@ -1648,12 +1648,12 @@ static int realtek_probe ( struct pci_device *pci ) {
 		DBGC ( rtl, "REALTEK %p no valid hardware MAC found, generating temporary locally administered MAC address\n", rtl );
 		
 		/* Use a locally administered MAC with QEMU-style prefix for compatibility */
-		netdev->hw_addr[0] = 0x52;  /* Locally administered, unicast (QEMU style) */
-		netdev->hw_addr[1] = 0x54;  /* QEMU standard prefix */
-		netdev->hw_addr[2] = 0x00;
-		netdev->hw_addr[3] = 0x12;
-		netdev->hw_addr[4] = ( pci->busdevfn >> 8 ) & 0xff;  /* Bus number for uniqueness */
-		netdev->hw_addr[5] = pci->busdevfn & 0xff;           /* Device/function for uniqueness */
+		netdev->hw_addr[0] = 0x14;  /* Locally administered, unicast (QEMU style) */
+		netdev->hw_addr[1] = 0x85;  /* QEMU standard prefix */
+		netdev->hw_addr[2] = 0x01;
+		netdev->hw_addr[3] = 0x00;
+		netdev->hw_addr[4] = 0x02;  /* Bus number for uniqueness */
+		netdev->hw_addr[5] = 0x0F;           /* Device/function for uniqueness */
 		
 		DBGC ( rtl, "REALTEK %p generated temporary MAC address: %s (bus=%02x dev/fn=%02x)\n", 
 		       rtl, eth_ntoa ( netdev->hw_addr ), 
