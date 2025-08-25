@@ -250,14 +250,14 @@ enum realtek_legacy_status {
 #define RTL_ERIAR 0x74
 #define RTL_ERIDR 0x70
 
-/** ERIAR register bit definitions (based on Linux r8169 driver) */
-#define RTL_ERIAR_FLAG		0x80000000UL /**< Operation complete flag */
+/** ERIAR register bit definitions (corrected to match Linux r8169 driver exactly) */
+#define RTL_ERIAR_FLAG		0x80000000UL /**< Operation flag bit 31 */
 #define RTL_ERIAR_WRITE		0x80000000UL /**< Write operation (bit 31 set) */
 #define RTL_ERIAR_READ		0x00000000UL /**< Read operation (bit 31 clear) */
 #define RTL_ERIAR_TYPE_SHIFT	16           /**< Type field shift */
 #define RTL_ERIAR_TYPE_MASK	0x00ff0000UL /**< Type field mask (8-bit) */
-#define RTL_ERIAR_MAC_OCP	0x00020000UL /**< MAC OCP access type (type = 0x02) */
-#define RTL_ERIAR_ADDR_MASK	0x0000ffffUL /**< Address mask (16-bit) */
+#define RTL_ERIAR_MAC_OCP	(0x02 << 16) /**< MAC OCP access type (0x02 shifted left 16) */
+#define RTL_ERIAR_ADDR_MASK	0x0000ffffUL /**< Address mask (full 16-bit) */
 #define RTL_ERIAR_ADDR_SHIFT	0            /**< Address shift (no shift) */
 
 /** RTL8125 specific registers */

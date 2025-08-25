@@ -360,7 +360,7 @@ static int realtek_ocp_ready ( struct realtek_nic *rtl ) {
 }
 
 /**
- * Read RTL8125 MAC OCP register (based on Linux r8168_mac_ocp_read)
+ * Read RTL8125 MAC OCP register (corrected to match Linux r8169 exactly)
  *
  * @v rtl		Realtek device
  * @v addr		OCP register address
@@ -378,20 +378,20 @@ static uint16_t realtek_ocp_read ( struct realtek_nic *rtl, uint16_t addr ) {
 		return 0xffff;
 	}
 
-	/* According to Linux r8169, for RTL8125 MAC OCP read:
-	 * 1. Write ERIAR with FLAG=1, TYPE=MAC_OCP, address
-	 * 2. Wait for FLAG to become 0 (operation complete)
+	/* Linux r8169 for RTL8125 MAC OCP read:
+	 * 1. Write ERIAR with FLAG=0 (bit 31 clear), TYPE=MAC_OCP, address (full 16-bit)
+	 * 2. Wait for FLAG to become 1 (bit 31 set) indicating completion
 	 * 3. Read result from ERIDR
 	 */
-	eriar_value = RTL_ERIAR_FLAG | RTL_ERIAR_MAC_OCP | ( addr & RTL_ERIAR_ADDR_MASK );
+	eriar_value = RTL_ERIAR_READ | RTL_ERIAR_MAC_OCP | ( addr & RTL_ERIAR_ADDR_MASK );
 	
-	DBGC2 ( rtl, "REALTEK %p OCP writing ERIAR=0x%08x for read\n", rtl, eriar_value );
+	DBGC2 ( rtl, "REALTEK %p OCP writing ERIAR=0x%08x for read (addr=0x%04x)\n", rtl, eriar_value, addr );
 	writel ( eriar_value, rtl->regs + RTL_ERIAR );
 
-	/* Wait for completion - bit 31 becomes 0 when operation is complete */
+	/* Wait for completion - bit 31 becomes 1 when read operation is complete */
 	for ( i = 0 ; i < 2000 ; i++ ) {
 		eriar_value = readl ( rtl->regs + RTL_ERIAR );
-		if ( ! ( eriar_value & RTL_ERIAR_FLAG ) )
+		if ( eriar_value & RTL_ERIAR_FLAG )  /* Wait for bit 31 to SET for reads */
 			break;
 		udelay ( 1 );
 	}
@@ -416,6 +416,13 @@ static uint16_t realtek_ocp_read ( struct realtek_nic *rtl, uint16_t addr ) {
  * @v addr		OCP register address
  * @v value		Register value
  */
+/**
+ * Write RTL8125 MAC OCP register (corrected to match Linux r8169 exactly)
+ *
+ * @v rtl		Realtek device
+ * @v addr		OCP register address
+ * @v value		Register value
+ */
 static void realtek_ocp_write ( struct realtek_nic *rtl, uint16_t addr, uint16_t value ) {
 	unsigned int i;
 	uint32_t eriar_value;
@@ -431,20 +438,20 @@ static void realtek_ocp_write ( struct realtek_nic *rtl, uint16_t addr, uint16_t
 	/* Write value to ERIDR first */
 	writel ( value, rtl->regs + RTL_ERIDR );
 	
-	/* According to Linux r8169, for RTL8125 MAC OCP write:
+	/* Linux r8169 for RTL8125 MAC OCP write:
 	 * 1. Write data to ERIDR
-	 * 2. Write ERIAR with FLAG=1, TYPE=MAC_OCP, address  
-	 * 3. Wait for FLAG to become 0 (operation complete)
+	 * 2. Write ERIAR with FLAG=1 (bit 31 set), TYPE=MAC_OCP, address (full 16-bit)  
+	 * 3. Wait for FLAG to become 0 (bit 31 clear) indicating completion
 	 */
-	eriar_value = RTL_ERIAR_FLAG | RTL_ERIAR_MAC_OCP | ( addr & RTL_ERIAR_ADDR_MASK );
+	eriar_value = RTL_ERIAR_WRITE | RTL_ERIAR_MAC_OCP | ( addr & RTL_ERIAR_ADDR_MASK );
 	
-	DBGC2 ( rtl, "REALTEK %p OCP writing ERIAR=0x%08x for write\n", rtl, eriar_value );
+	DBGC2 ( rtl, "REALTEK %p OCP writing ERIAR=0x%08x for write (addr=0x%04x)\n", rtl, eriar_value, addr );
 	writel ( eriar_value, rtl->regs + RTL_ERIAR );
 
-	/* Wait for completion - bit 31 becomes 0 when operation is complete */
+	/* Wait for completion - bit 31 becomes 0 when write operation is complete */
 	for ( i = 0 ; i < 2000 ; i++ ) {
 		eriar_value = readl ( rtl->regs + RTL_ERIAR );
-		if ( ! ( eriar_value & RTL_ERIAR_FLAG ) )
+		if ( ! ( eriar_value & RTL_ERIAR_FLAG ) )  /* Wait for bit 31 to CLEAR for writes */
 			break;
 		udelay ( 1 );
 	}
@@ -456,6 +463,85 @@ static void realtek_ocp_write ( struct realtek_nic *rtl, uint16_t addr, uint16_t
 		DBGC2 ( rtl, "REALTEK %p OCP write completed: addr=0x%04x value=0x%04x (took %d iterations)\n", 
 		        rtl, addr, value, i );
 	}
+}
+
+/**
+ * Initialize RTL8125 for OCP access
+ *
+ * @v rtl		Realtek device
+ * @ret rc		Return status code
+ */
+static int realtek_init_8125_ocp ( struct realtek_nic *rtl ) {
+	uint32_t val;
+	int i;
+
+	DBGC ( rtl, "REALTEK %p initializing RTL8125 for OCP access\n", rtl );
+
+	/* Step 1: Check if ERIAR/ERIDR registers are accessible */
+	DBGC ( rtl, "REALTEK %p checking ERIAR/ERIDR register accessibility\n", rtl );
+	
+	/* Try to read ERIAR register */
+	val = readl ( rtl->regs + RTL_ERIAR );
+	DBGC ( rtl, "REALTEK %p initial ERIAR value: 0x%08x\n", rtl, val );
+	
+	/* Try to read ERIDR register */
+	val = readl ( rtl->regs + RTL_ERIDR );
+	DBGC ( rtl, "REALTEK %p initial ERIDR value: 0x%08x\n", rtl, val );
+
+	/* Step 2: Enable RTL8125 specific features that might be needed for OCP */
+	DBGC ( rtl, "REALTEK %p enabling RTL8125 OCP prerequisites\n", rtl );
+	
+	/* Enable Configuration Space Access - some RTL8125 need this */
+	val = readl ( rtl->regs + RTL_CPCR );
+	DBGC ( rtl, "REALTEK %p C+ Command original: 0x%08x\n", rtl, val );
+	
+	/* Ensure C+ mode is enabled (required for OCP access) */
+	val |= ( RTL_CPCR_CPRX | RTL_CPCR_CPTX );
+	writel ( val, rtl->regs + RTL_CPCR );
+	udelay ( 10 );
+	
+	val = readl ( rtl->regs + RTL_CPCR );
+	DBGC ( rtl, "REALTEK %p C+ Command after enable: 0x%08x\n", rtl, val );
+
+	/* Step 3: Clear any pending ERIAR operations */
+	DBGC ( rtl, "REALTEK %p clearing any pending ERIAR operations\n", rtl );
+	
+	/* Wait for ERIAR to be not busy */
+	for ( i = 0 ; i < 1000 ; i++ ) {
+		val = readl ( rtl->regs + RTL_ERIAR );
+		if ( ! ( val & RTL_ERIAR_FLAG ) )
+			break;
+		udelay ( 10 );
+	}
+	
+	if ( i >= 1000 ) {
+		DBGC ( rtl, "REALTEK %p ERIAR still busy after 1000 iterations: 0x%08x\n", rtl, val );
+		DBGC ( rtl, "REALTEK %p attempting to force clear ERIAR\n", rtl );
+		
+		/* Try to force clear by writing 0 */
+		writel ( 0x00000000, rtl->regs + RTL_ERIAR );
+		udelay ( 100 );
+		
+		val = readl ( rtl->regs + RTL_ERIAR );
+		DBGC ( rtl, "REALTEK %p ERIAR after force clear: 0x%08x\n", rtl, val );
+	} else {
+		DBGC ( rtl, "REALTEK %p ERIAR ready after %d iterations\n", rtl, i );
+	}
+
+	/* Step 4: Test basic OCP access with a simple read */
+	DBGC ( rtl, "REALTEK %p testing basic OCP access\n", rtl );
+	
+	/* Try reading a known OCP register (0xe100 - often contains chip info) */
+	uint16_t test_val = realtek_ocp_read ( rtl, 0xe100 );
+	DBGC ( rtl, "REALTEK %p OCP test read 0xe100: 0x%04x\n", rtl, test_val );
+	
+	if ( test_val == 0xffff ) {
+		DBGC ( rtl, "REALTEK %p OCP test read failed - OCP not functional\n", rtl );
+		return -EIO;
+	}
+	
+	DBGC ( rtl, "REALTEK %p RTL8125 OCP initialization successful\n", rtl );
+	return 0;
 }
 
 /**
@@ -880,15 +966,82 @@ static void realtek_refill_rx ( struct realtek_nic *rtl ) {
 static void realtek_set_mac_address ( struct net_device *netdev ) {
 	struct realtek_nic *rtl = netdev->priv;
 	unsigned int i;
+	int success = 0;
 
-	/* Program MAC address into hardware registers */
 	DBGC ( rtl, "REALTEK %p programming MAC address: %s\n", 
 	       rtl, eth_ntoa ( netdev->hw_addr ) );
-	for ( i = 0 ; i < ETH_ALEN ; i++ ) {
-		writeb ( netdev->hw_addr[i], rtl->regs + RTL_IDR0 + i );
+
+	/* RTL8125 family may need special MAC programming approach */
+	if ( rtl->use_8125 ) {
+		DBGC ( rtl, "REALTEK %p RTL8125 family detected, trying enhanced MAC programming\n", rtl );
+		
+		/* Method 1: Try to unlock MAC registers first */
+		DBGC ( rtl, "REALTEK %p attempting to unlock MAC registers\n", rtl );
+		writeb ( 0xc0, rtl->regs + RTL_9346CR );  /* Unlock registers */
+		udelay ( 10 );
+		
+		/* Try programming MAC address */
+		for ( i = 0 ; i < ETH_ALEN ; i++ ) {
+			writeb ( netdev->hw_addr[i], rtl->regs + RTL_IDR0 + i );
+		}
+		
+		/* Verify this method worked */
+		success = 1;
+		for ( i = 0 ; i < ETH_ALEN ; i++ ) {
+			uint8_t hw_byte = readb ( rtl->regs + RTL_IDR0 + i );
+			if ( hw_byte != netdev->hw_addr[i] ) {
+				success = 0;
+				break;
+			}
+		}
+		
+		if ( success ) {
+			DBGC ( rtl, "REALTEK %p RTL8125 MAC programming successful with unlock method\n", rtl );
+		} else {
+			DBGC ( rtl, "REALTEK %p RTL8125 MAC programming failed with unlock method\n", rtl );
+			
+			/* Method 2: Try with different unlock sequence */
+			DBGC ( rtl, "REALTEK %p trying alternative unlock sequence\n", rtl );
+			writeb ( 0x00, rtl->regs + RTL_9346CR );  /* Lock first */
+			udelay ( 10 );
+			writeb ( 0xc0, rtl->regs + RTL_9346CR );  /* Then unlock */
+			udelay ( 100 );  /* Longer delay */
+			
+			for ( i = 0 ; i < ETH_ALEN ; i++ ) {
+				writeb ( netdev->hw_addr[i], rtl->regs + RTL_IDR0 + i );
+				udelay ( 1 );  /* Small delay between writes */
+			}
+			
+			/* Verify alternative method */
+			success = 1;
+			for ( i = 0 ; i < ETH_ALEN ; i++ ) {
+				uint8_t hw_byte = readb ( rtl->regs + RTL_IDR0 + i );
+				if ( hw_byte != netdev->hw_addr[i] ) {
+					success = 0;
+					break;
+				}
+			}
+			
+			if ( success ) {
+				DBGC ( rtl, "REALTEK %p RTL8125 MAC programming successful with alternative method\n", rtl );
+			} else {
+				DBGC ( rtl, "REALTEK %p RTL8125 MAC programming failed - IDR registers may be read-only\n", rtl );
+				DBGC ( rtl, "REALTEK %p RTL8125 will continue with software MAC - hardware may not receive packets\n", rtl );
+			}
+		}
+		
+		/* Lock registers back */
+		writeb ( 0x00, rtl->regs + RTL_9346CR );
+		
+	} else {
+		/* Legacy chips - use standard method */
+		for ( i = 0 ; i < ETH_ALEN ; i++ ) {
+			writeb ( netdev->hw_addr[i], rtl->regs + RTL_IDR0 + i );
+		}
+		success = 1;  /* Assume success for legacy chips */
 	}
 	
-	/* Read back and verify MAC address */
+	/* Read back and verify MAC address for all chips */
 	DBGC ( rtl, "REALTEK %p verifying MAC address in hardware:\n", rtl );
 	for ( i = 0 ; i < ETH_ALEN ; i++ ) {
 		uint8_t hw_byte = readb ( rtl->regs + RTL_IDR0 + i );
@@ -1254,27 +1407,8 @@ static void realtek_poll ( struct net_device *netdev ) {
 	struct realtek_nic *rtl = netdev->priv;
 	uint32_t isr32;
 	uint16_t isr;
-	static uint8_t last_hw_addr[ETH_ALEN] = { 0 };
-	static int mac_check_count = 0;
 
-	/* Check if MAC address needs to be reprogrammed (check every 10 polls) */
-	if ( (mac_check_count++ % 10) == 0 || memcmp ( netdev->hw_addr, last_hw_addr, ETH_ALEN ) != 0 ) {
-		if ( (mac_check_count % 10) == 1 ) {  /* Only log every 10th check to avoid spam */
-			DBGC ( rtl, "REALTEK %p MAC check %d: current=%s, last=%02x:%02x:%02x:%02x:%02x:%02x\n",
-			       rtl, mac_check_count, eth_ntoa ( netdev->hw_addr ),
-			       last_hw_addr[0], last_hw_addr[1], last_hw_addr[2],
-			       last_hw_addr[3], last_hw_addr[4], last_hw_addr[5] );
-		}
-		
-		if ( memcmp ( netdev->hw_addr, last_hw_addr, ETH_ALEN ) != 0 ) {
-			DBGC ( rtl, "REALTEK %p MAC address changed from %02x:%02x:%02x:%02x:%02x:%02x to %s, reprogramming hardware\n", 
-			       rtl, last_hw_addr[0], last_hw_addr[1], last_hw_addr[2],
-			       last_hw_addr[3], last_hw_addr[4], last_hw_addr[5],
-			       eth_ntoa ( netdev->hw_addr ) );
-			realtek_set_mac_address ( netdev );
-			memcpy ( last_hw_addr, netdev->hw_addr, ETH_ALEN );
-		}
-	}
+	/* MAC address checking removed - no longer needed since we generate it correctly */
 
 	if ( rtl->use_8125 ) {
 		/* RTL8125 uses 32-bit ISR */
@@ -1507,12 +1641,6 @@ static int realtek_probe ( struct pci_device *pci ) {
 	/* Detect device type */
 	realtek_detect ( rtl, pci );
 
-	/* Disable new TX descriptor format for RTL8125 */
-	if ( rtl->use_8125 ) {
-		DBGC ( rtl, "REALTEK %p RTL8125 family detected, disabling new descriptor format\n", rtl );
-		realtek_disable_new_desc ( rtl );
-	}
-
 	/* Generate a locally administered MAC address based on PCI location */
 	DBGC ( rtl, "REALTEK %p generating temporary locally administered MAC address\n", rtl );
 	
@@ -1527,6 +1655,22 @@ static int realtek_probe ( struct pci_device *pci ) {
 	DBGC ( rtl, "REALTEK %p generated temporary MAC address: %s (bus=%02x dev/fn=%02x)\n", 
 	       rtl, eth_ntoa ( netdev->hw_addr ), 
 	       (pci->busdevfn >> 8) & 0xff, pci->busdevfn & 0xff );
+
+	/* Disable new TX descriptor format for RTL8125 - do this AFTER MAC generation */
+	if ( rtl->use_8125 ) {
+		DBGC ( rtl, "REALTEK %p RTL8125 family detected, initializing OCP access\n", rtl );
+		
+		/* Initialize RTL8125 for OCP access first */
+		int rc = realtek_init_8125_ocp ( rtl );
+		if ( rc != 0 ) {
+			DBGC ( rtl, "REALTEK %p RTL8125 OCP initialization failed: %s\n", 
+			       rtl, strerror ( rc ) );
+			DBGC ( rtl, "REALTEK %p continuing without OCP - new descriptor format may remain enabled\n", rtl );
+		} else {
+			DBGC ( rtl, "REALTEK %p RTL8125 OCP access working, disabling new descriptor format\n", rtl );
+			realtek_disable_new_desc ( rtl );
+		}
+	}
 
 	/* Initialise and reset MII interface */
 	DBGC ( rtl, "REALTEK %p initializing MII interface\n", rtl );
