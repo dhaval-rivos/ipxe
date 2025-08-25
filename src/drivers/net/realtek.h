@@ -306,6 +306,11 @@ realtek_init_ring ( struct realtek_ring *ring, unsigned int count,
 		    unsigned int reg ) {
 	ring->len = ( count * sizeof ( ring->desc[0] ) );
 	ring->reg = reg;
+	ring->prod = 0;
+	ring->cons = 0;
+	ring->desc = NULL;
+	/* zero the DMA map so stale upper/lower halves can't leak */
+	memset(&ring->map, 0, sizeof(ring->map));
 }
 
 /** Receive buffer (legacy mode *) */
