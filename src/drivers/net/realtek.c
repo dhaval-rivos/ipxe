@@ -181,7 +181,7 @@ static struct bit_basher_operations realtek_basher_ops = {
  * @v netdev		Network device
  * @ret rc		Return status code
  */
-static int realtek_init_eeprom ( struct net_device *netdev ) {
+static int __unused realtek_init_eeprom ( struct net_device *netdev ) {
 	struct realtek_nic *rtl = netdev->priv;
 	uint16_t id;
 	int rc;
@@ -873,6 +873,32 @@ static void realtek_refill_rx ( struct realtek_nic *rtl ) {
 }
 
 /**
+ * Program MAC address into hardware registers
+ *
+ * @v netdev		Network device
+ */
+static void realtek_set_mac_address ( struct net_device *netdev ) {
+	struct realtek_nic *rtl = netdev->priv;
+	unsigned int i;
+
+	/* Program MAC address into hardware registers */
+	DBGC ( rtl, "REALTEK %p programming MAC address: %s\n", 
+	       rtl, eth_ntoa ( netdev->hw_addr ) );
+	for ( i = 0 ; i < ETH_ALEN ; i++ ) {
+		writeb ( netdev->hw_addr[i], rtl->regs + RTL_IDR0 + i );
+	}
+	
+	/* Read back and verify MAC address */
+	DBGC ( rtl, "REALTEK %p verifying MAC address in hardware:\n", rtl );
+	for ( i = 0 ; i < ETH_ALEN ; i++ ) {
+		uint8_t hw_byte = readb ( rtl->regs + RTL_IDR0 + i );
+		DBGC ( rtl, "REALTEK %p   IDR%d: wrote %02x, read %02x %s\n", 
+		       rtl, i, netdev->hw_addr[i], hw_byte,
+		       (hw_byte == netdev->hw_addr[i]) ? "OK" : "MISMATCH!" );
+	}
+}
+
+/**
  * Open network device
  *
  * @v netdev		Network device
@@ -900,20 +926,7 @@ static int realtek_open ( struct net_device *netdev ) {
 		goto err_create_buffer;
 
 	/* Program MAC address into hardware registers */
-	DBGC ( rtl, "REALTEK %p programming MAC address: %s\n", 
-	       rtl, eth_ntoa ( netdev->hw_addr ) );
-	for ( unsigned int i = 0 ; i < ETH_ALEN ; i++ ) {
-		writeb ( netdev->hw_addr[i], rtl->regs + RTL_IDR0 + i );
-	}
-	
-	/* Read back and verify MAC address */
-	DBGC ( rtl, "REALTEK %p verifying MAC address in hardware:\n", rtl );
-	for ( unsigned int i = 0 ; i < ETH_ALEN ; i++ ) {
-		uint8_t hw_byte = readb ( rtl->regs + RTL_IDR0 + i );
-		DBGC ( rtl, "REALTEK %p   IDR%d: wrote %02x, read %02x %s\n", 
-		       rtl, i, netdev->hw_addr[i], hw_byte,
-		       (hw_byte == netdev->hw_addr[i]) ? "OK" : "MISMATCH!" );
-	}
+	realtek_set_mac_address ( netdev );
 
 	/* Accept all packets */
 	writel ( 0xffffffffUL, rtl->regs + RTL_MAR0 );
@@ -944,6 +957,11 @@ static int realtek_open ( struct net_device *netdev ) {
 
 	/* Update link state */
 	realtek_check_link ( netdev );
+
+	/* Final MAC address check after everything is initialized */
+	DBGC ( rtl, "REALTEK %p final MAC address check at end of open: %s\n", 
+	       rtl, eth_ntoa ( netdev->hw_addr ) );
+	realtek_set_mac_address ( netdev );
 
 	return 0;
 
@@ -1236,6 +1254,27 @@ static void realtek_poll ( struct net_device *netdev ) {
 	struct realtek_nic *rtl = netdev->priv;
 	uint32_t isr32;
 	uint16_t isr;
+	static uint8_t last_hw_addr[ETH_ALEN] = { 0 };
+	static int mac_check_count = 0;
+
+	/* Check if MAC address needs to be reprogrammed (check every 10 polls) */
+	if ( (mac_check_count++ % 10) == 0 || memcmp ( netdev->hw_addr, last_hw_addr, ETH_ALEN ) != 0 ) {
+		if ( (mac_check_count % 10) == 1 ) {  /* Only log every 10th check to avoid spam */
+			DBGC ( rtl, "REALTEK %p MAC check %d: current=%s, last=%02x:%02x:%02x:%02x:%02x:%02x\n",
+			       rtl, mac_check_count, eth_ntoa ( netdev->hw_addr ),
+			       last_hw_addr[0], last_hw_addr[1], last_hw_addr[2],
+			       last_hw_addr[3], last_hw_addr[4], last_hw_addr[5] );
+		}
+		
+		if ( memcmp ( netdev->hw_addr, last_hw_addr, ETH_ALEN ) != 0 ) {
+			DBGC ( rtl, "REALTEK %p MAC address changed from %02x:%02x:%02x:%02x:%02x:%02x to %s, reprogramming hardware\n", 
+			       rtl, last_hw_addr[0], last_hw_addr[1], last_hw_addr[2],
+			       last_hw_addr[3], last_hw_addr[4], last_hw_addr[5],
+			       eth_ntoa ( netdev->hw_addr ) );
+			realtek_set_mac_address ( netdev );
+			memcpy ( last_hw_addr, netdev->hw_addr, ETH_ALEN );
+		}
+	}
 
 	if ( rtl->use_8125 ) {
 		/* RTL8125 uses 32-bit ISR */
@@ -1416,7 +1455,6 @@ static void realtek_detect ( struct realtek_nic *rtl, struct pci_device *pci ) {
 static int realtek_probe ( struct pci_device *pci ) {
 	struct net_device *netdev;
 	struct realtek_nic *rtl;
-	unsigned int i;
 	int rc;
 
 	DBGC ( NULL, "REALTEK probing PCI device %04x:%04x\n", pci->vendor, pci->device );
@@ -1475,30 +1513,20 @@ static int realtek_probe ( struct pci_device *pci ) {
 		realtek_disable_new_desc ( rtl );
 	}
 
-	/* Initialise EEPROM */
-	if ( rtl->eeprom.bus &&
-	     ( ( rc = realtek_init_eeprom ( netdev ) ) == 0 ) ) {
-
-		/* Read MAC address from EEPROM */
-		if ( ( rc = nvs_read ( &rtl->eeprom.nvs, RTL_EEPROM_MAC,
-				       netdev->hw_addr, ETH_ALEN ) ) != 0 ) {
-			DBGC ( rtl, "REALTEK %p could not read MAC address: "
-			       "%s\n", rtl, strerror ( rc ) );
-			goto err_nvs_read;
-		}
-
-	} else {
-
-		/* EEPROM not present.  Fall back to reading the
-		 * current ID register value, which will hopefully
-		 * have been programmed by the platform firmware.
-		 */
-		DBGC ( rtl, "REALTEK %p EEPROM not present, reading MAC from ID registers\n", rtl );
-		for ( i = 0 ; i < ETH_ALEN ; i++ )
-			netdev->hw_addr[i] = readb ( rtl->regs + RTL_IDR0 + i );
-		DBGC ( rtl, "REALTEK %p MAC address from registers: %s\n", 
-		       rtl, eth_ntoa ( netdev->hw_addr ) );
-	}
+	/* Generate a locally administered MAC address based on PCI location */
+	DBGC ( rtl, "REALTEK %p generating temporary locally administered MAC address\n", rtl );
+	
+	/* Use a locally administered MAC with QEMU-style prefix for compatibility */
+	netdev->hw_addr[0] = 0x52;  /* Locally administered, unicast (QEMU style) */
+	netdev->hw_addr[1] = 0x54;  /* QEMU standard prefix */
+	netdev->hw_addr[2] = 0x00;
+	netdev->hw_addr[3] = 0x12;
+	netdev->hw_addr[4] = ( pci->busdevfn >> 8 ) & 0xff;  /* Bus number for uniqueness */
+	netdev->hw_addr[5] = pci->busdevfn & 0xff;           /* Device/function for uniqueness */
+	
+	DBGC ( rtl, "REALTEK %p generated temporary MAC address: %s (bus=%02x dev/fn=%02x)\n", 
+	       rtl, eth_ntoa ( netdev->hw_addr ), 
+	       (pci->busdevfn >> 8) & 0xff, pci->busdevfn & 0xff );
 
 	/* Initialise and reset MII interface */
 	DBGC ( rtl, "REALTEK %p initializing MII interface\n", rtl );
@@ -1512,6 +1540,10 @@ static int realtek_probe ( struct pci_device *pci ) {
 	       rtl, eth_ntoa ( netdev->hw_addr ) );
 	if ( ( rc = register_netdev ( netdev ) ) != 0 )
 		goto err_register_netdev;
+
+	/* Check MAC address after registration - it might have changed */
+	DBGC ( rtl, "REALTEK %p MAC address after registration: %s\n", 
+	       rtl, eth_ntoa ( netdev->hw_addr ) );
 
 	/* Set initial link state */
 	realtek_check_link ( netdev );
@@ -1532,7 +1564,6 @@ static int realtek_probe ( struct pci_device *pci ) {
 	unregister_netdev ( netdev );
  err_register_netdev:
  err_phy_reset:
- err_nvs_read:
 	realtek_reset ( rtl, pci );
  err_reset:
 	iounmap ( rtl->regs );
