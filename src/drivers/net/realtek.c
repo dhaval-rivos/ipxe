@@ -543,39 +543,56 @@ static void realtek_ocp_write ( struct realtek_nic *rtl, uint16_t addr, uint16_t
 static void realtek_disable_new_desc ( struct realtek_nic *rtl ) {
 	uint16_t val;
 
-	DBGC ( rtl, "REALTEK %p disabling RTL8125 new TX descriptor format\n", rtl );
-	
-	/* First, let's check if OCP access is working at all */
-	DBGC ( rtl, "REALTEK %p testing OCP access with a simple read\n", rtl );
-	
-	/* Read current value of OCP register 0xeb58 */
+	/* Quick attempt to disable new descriptor format for RTL8125 */
 	val = realtek_ocp_read ( rtl, 0xeb58 );
-	DBGC ( rtl, "REALTEK %p OCP 0xeb58 original value: 0x%04x\n", rtl, val );
-	
-	/* Check if we got a valid response (not 0xffff timeout value) */
-	if ( val == 0xffff ) {
-		DBGC ( rtl, "REALTEK %p OCP access failed, skipping new descriptor disable\n", rtl );
-		DBGC ( rtl, "REALTEK %p this may not be a problem - some RTL8125 variants work without OCP\n", rtl );
-		return;
+	if ( val != 0xffff ) {
+		/* Clear bit 0 to disable new descriptor format */
+		realtek_ocp_write ( rtl, 0xeb58, val & ~0x0001 );
+		DBGC2 ( rtl, "REALTEK %p disabled new descriptor format\n", rtl );
 	}
-	
-	/* Clear bit 0 to disable new descriptor format */
-	val &= ~0x0001;
-	DBGC ( rtl, "REALTEK %p OCP 0xeb58 modified value: 0x%04x\n", rtl, val );
-	
-	/* Write back the modified value */
-	realtek_ocp_write ( rtl, 0xeb58, val );
-	
-	/* Verify the write */
-	uint16_t verify = realtek_ocp_read ( rtl, 0xeb58 );
-	DBGC ( rtl, "REALTEK %p OCP 0xeb58 verification read: 0x%04x\n", rtl, verify );
-	
-	if ( verify == val ) {
-		DBGC ( rtl, "REALTEK %p RTL8125 new descriptor format successfully disabled\n", rtl );
+}
+
+/**
+ * Get receive packet length from descriptor
+ *
+ * @v rtl		Realtek device
+ * @v rx		Receive descriptor
+ * @ret len		Packet length (excluding CRC)
+ */
+static size_t realtek_rx_len ( struct realtek_nic *rtl, struct realtek_descriptor *rx ) {
+	uint16_t flags = le16_to_cpu ( rx->flags );
+	uint16_t length = le16_to_cpu ( rx->length );
+	size_t len;
+
+	/* For RTL8125, check if this looks like new descriptor format */
+	if ( rtl->use_8125 ) {
+		/* RTL8125 - check for new descriptor format indicators */
+		if ( ( flags & 0xf000 ) != 0x3000 ) {
+			/* Possible new format - extract length differently */
+			/* In new format, length might be in different bits */
+			len = ( length & 0x3fff );  /* 14-bit length field */
+			DBGC2 ( rtl, "REALTEK %p RX new format length: %zd (flags 0x%04x, raw_len 0x%04x)\n",
+				rtl, len, flags, length );
+		} else {
+			/* Traditional format */
+			len = ( length & RTL_DESC_SIZE_MASK );
+			DBGC2 ( rtl, "REALTEK %p RX traditional format length: %zd (flags 0x%04x)\n",
+				rtl, len, flags );
+		}
 	} else {
-		DBGC ( rtl, "REALTEK %p RTL8125 new descriptor format disable verification failed\n", rtl );
-		DBGC ( rtl, "REALTEK %p continuing anyway - device may still work\n", rtl );
+		/* Not RTL8125 - use traditional format */
+		len = ( length & RTL_DESC_SIZE_MASK );
 	}
+
+	/* Subtract CRC if present and length is reasonable */
+	if ( len > 4 && len <= RTL_RX_MAX_LEN ) {
+		len -= 4;  /* Strip CRC */
+	} else if ( len > RTL_RX_MAX_LEN ) {
+		DBGC ( rtl, "REALTEK %p RX suspicious length %zd, using fallback\n", rtl, len );
+		len = RTL_RX_MAX_LEN - 4;
+	}
+
+	return len;
 }
 
 /******************************************************************************
@@ -1363,11 +1380,28 @@ static void realtek_poll_rx ( struct net_device *netdev ) {
 		if ( rx->flags & cpu_to_le16 ( RTL_DESC_OWN ) )
 			return;
 
+		/* Get packet length using format-aware helper */
+		len = realtek_rx_len ( rtl, rx );
+
+		/* Enhanced descriptor debugging for RTL8125 */
+		if ( rtl->use_8125 ) {
+			DBGC2 ( rtl, "REALTEK %p RX %d: flags=0x%04x length=0x%04x parsed_len=%zd\n",
+				rtl, rx_idx, le16_to_cpu ( rx->flags ),
+				le16_to_cpu ( rx->length ), len );
+		}
+
 		/* Populate I/O buffer */
 		iobuf = rtl->rx_iobuf[rx_idx];
 		rtl->rx_iobuf[rx_idx] = NULL;
-		len = ( le16_to_cpu ( rx->length ) & RTL_DESC_SIZE_MASK );
-		iob_put ( iobuf, ( len - 4 /* strip CRC */ ) );
+		
+		/* Validate length before adjusting buffer */
+		if ( len > iob_tailroom ( iobuf ) ) {
+			DBGC ( rtl, "REALTEK %p RX %d length %zd exceeds buffer size %zd\n",
+			       rtl, rx_idx, len, iob_tailroom ( iobuf ) );
+			len = iob_tailroom ( iobuf );
+		}
+		
+		iob_put ( iobuf, len );
 
 		/* Hand off to network stack */
 		if ( rx->flags & cpu_to_le16 ( RTL_DESC_RES ) ) {
