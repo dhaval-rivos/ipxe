@@ -119,6 +119,7 @@ enum realtek_legacy_status {
 
 /** Transmit Priority Polling Register (byte, 8169 only) */
 #define RTL_TPPOLL_8169 0x38
+#define RTL_TPPOLL		0x38	/**< Generic TPPoll for non-8125 devices */
 #define RTL_TPPOLL_NPQ		0x40	/**< Normal Priority Queue Polling */
 
 /** Interrupt Mask Register (word) */
@@ -131,6 +132,11 @@ enum realtek_legacy_status {
 
 /** Interrupt Status Register (word) */
 #define RTL_ISR 0x3e
+
+/** RTL8125 register offsets */
+#define RTL_8125_IMR    0x38  /* 32-bit interrupt mask register */
+#define RTL_8125_ISR    0x3c  /* 32-bit interrupt status register */
+#define RTL_8125_TPPOLL 0x90  /* 16-bit transmit poll register */
 
 /** Transmit (Tx) Configuration Register (dword) */
 #define RTL_TCR 0x40
@@ -237,6 +243,30 @@ enum realtek_legacy_status {
 /** Receive Descriptor Start Address Register (qword) */
 #define RTL_RDSAR 0xe4
 
+/** ERIAR register for OCP access (RTL8125) */
+#define RTL_ERIAR 0x74
+#define RTL_ERIDR 0x70
+
+/** ERIAR register bit definitions (corrected to match Linux r8169 driver exactly) */
+#define RTL_ERIAR_FLAG		0x80000000UL /**< Operation flag bit 31 */
+#define RTL_ERIAR_WRITE		0x80000000UL /**< Write operation (bit 31 set) */
+#define RTL_ERIAR_READ		0x00000000UL /**< Read operation (bit 31 clear) */
+#define RTL_ERIAR_TYPE_SHIFT	16           /**< Type field shift */
+#define RTL_ERIAR_TYPE_MASK	0x00ff0000UL /**< Type field mask (8-bit) */
+#define RTL_ERIAR_MAC_OCP	(0x02 << 16) /**< MAC OCP access type (0x02 shifted left 16) */
+#define RTL_ERIAR_ADDR_MASK	0x0000ffffUL /**< Address mask (full 16-bit) */
+#define RTL_ERIAR_ADDR_SHIFT	0            /**< Address shift (no shift) */
+
+/** RTL8125 specific registers */
+#define RTL_MCFG 0xf0      /**< Media configuration register */
+#define RTL_MCFG_8125 0x8c /**< RTL8125 media configuration */
+
+/** RTL8125 family device ID check (matching Linux r8169 driver) */
+#define RTL_IS_8125_FAMILY(vendor, device) \
+	( (vendor) == 0x10ec && \
+	  ( (device) == 0x8125 || (device) == 0x8126 || (device) == 0x8127 || \
+	    (device) == 0x3000 || (device) == 0x5000 ) )
+
 /** Number of receive descriptors */
 #define RTL_NUM_RX_DESC 4
 
@@ -273,6 +303,11 @@ realtek_init_ring ( struct realtek_ring *ring, unsigned int count,
 		    unsigned int reg ) {
 	ring->len = ( count * sizeof ( ring->desc[0] ) );
 	ring->reg = reg;
+	ring->prod = 0;
+	ring->cons = 0;
+	ring->desc = NULL;
+	/* zero the DMA map so stale upper/lower halves can't leak */
+	memset(&ring->map, 0, sizeof(ring->map));
 }
 
 /** Receive buffer (legacy mode *) */
@@ -308,6 +343,8 @@ struct realtek_nic {
 	int have_phy_regs;
 	/** TPPoll register offset */
 	unsigned int tppoll;
+	/** RTL8125 register layout flag */
+	unsigned int use_8125;
 
 	/** Transmit descriptor ring */
 	struct realtek_ring tx;

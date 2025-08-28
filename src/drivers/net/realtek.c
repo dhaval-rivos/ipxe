@@ -41,6 +41,10 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 #include <ipxe/threewire.h>
 #include <ipxe/bitbash.h>
 #include <ipxe/mii.h>
+#include <ipxe/efi/efi.h>
+#include <ipxe/efi/efi_pci.h>
+#include <ipxe/efi/efi_driver.h>
+#include <ipxe/efi/Protocol/PciIo.h>
 #include "realtek.h"
 
 /** @file
@@ -823,7 +827,11 @@ static int realtek_transmit ( struct net_device *netdev,
 		wmb();
 
 		/* Notify card that there are packets ready to transmit */
-		writeb ( RTL_TPPOLL_NPQ, rtl->regs + rtl->tppoll );
+		if ( rtl->use_8125 ) {
+			writew ( 0x0001, rtl->regs + RTL_8125_TPPOLL );
+		} else {
+			writeb ( RTL_TPPOLL_NPQ, rtl->regs + rtl->tppoll );
+		}
 	}
 
 	DBGC2 ( rtl, "REALTEK %p TX %d is [%lx,%lx)\n",
@@ -986,13 +994,24 @@ static void realtek_poll_rx ( struct net_device *netdev ) {
  */
 static void realtek_poll ( struct net_device *netdev ) {
 	struct realtek_nic *rtl = netdev->priv;
+	uint32_t isr32;
 	uint16_t isr;
 
-	/* Check for and acknowledge interrupts */
-	isr = readw ( rtl->regs + RTL_ISR );
-	if ( ! isr )
-		return;
-	writew ( isr, rtl->regs + RTL_ISR );
+	if ( rtl->use_8125 ) {
+		/* RTL8125 uses 32-bit ISR */
+		isr32 = readl ( rtl->regs + RTL_8125_ISR );
+		if ( ! isr32 )
+			return;
+		writel ( isr32, rtl->regs + RTL_8125_ISR );
+		/* Extract relevant interrupt bits (low 16 bits match old layout) */
+		isr = (uint16_t)( isr32 & 0xffff );
+	} else {
+		/* Traditional chips use 16-bit ISR */
+		isr = readw ( rtl->regs + RTL_ISR );
+		if ( ! isr )
+			return;
+		writew ( isr, rtl->regs + RTL_ISR );
+	}
 
 	/* Poll for TX completions, if applicable */
 	if ( isr & ( RTL_IRQ_TER | RTL_IRQ_TOK ) )
@@ -1018,12 +1037,17 @@ static void realtek_poll ( struct net_device *netdev ) {
  */
 static void realtek_irq ( struct net_device *netdev, int enable ) {
 	struct realtek_nic *rtl = netdev->priv;
-	uint16_t imr;
+	uint32_t mask;
 
 	/* Set interrupt mask */
-	imr = ( enable ? ( RTL_IRQ_PUN_LINKCHG | RTL_IRQ_TER | RTL_IRQ_TOK |
-			   RTL_IRQ_RER | RTL_IRQ_ROK ) : 0 );
-	writew ( imr, rtl->regs + RTL_IMR );
+	mask = ( enable ? ( RTL_IRQ_PUN_LINKCHG | RTL_IRQ_TER | RTL_IRQ_TOK |
+			    RTL_IRQ_RER | RTL_IRQ_ROK ) : 0 );
+
+	if ( rtl->use_8125 ) {
+		writel ( mask, rtl->regs + RTL_8125_IMR );
+	} else {
+		writew ( (uint16_t)mask, rtl->regs + RTL_IMR );
+	}
 }
 
 /** Realtek network device operations */
@@ -1046,12 +1070,25 @@ static struct net_device_operations realtek_operations = {
  * Detect device type
  *
  * @v rtl		Realtek device
+ * @v pci		PCI device
  */
-static void realtek_detect ( struct realtek_nic *rtl ) {
+static void realtek_detect ( struct realtek_nic *rtl, struct pci_device *pci ) {
 	uint16_t rms;
 	uint16_t check_rms;
 	uint16_t cpcr;
 	uint16_t check_cpcr;
+
+	/* Check for RTL8125 family by PCI device ID */
+	if ( RTL_IS_8125_FAMILY ( pci->vendor, pci->device ) ) {
+		rtl->use_8125 = 1;
+		rtl->have_phy_regs = 1;
+		rtl->tppoll = RTL_8125_TPPOLL;
+		rtl->eeprom.bus = &rtl->spibit.bus;
+		return;
+	}
+
+	/* Default to non-8125 mode */
+	rtl->use_8125 = 0;
 
 	/* The RX Packet Maximum Size register is present only on
 	 * 8169.  Try to set to our intended MTU.
@@ -1099,6 +1136,50 @@ static void realtek_detect ( struct realtek_nic *rtl ) {
 		rtl->eeprom.bus = &rtl->spibit.bus;
 	}
 }
+/**
+ * Enable Dual Address Cycle if supported by the device
+ *
+ * @v rtl	Realtek device  
+ * @v pci_io	EFI PCI I/O protocol
+ * @ret rc	Return status code
+ */
+static int realtek_enable_dac_if_supported ( struct realtek_nic *rtl, EFI_PCI_IO_PROTOCOL *pci_io ) {
+	EFI_STATUS efirc;
+	UINT64 supported = 0;
+	int rc;
+
+	/* Query supported attributes */
+	efirc = pci_io->Attributes ( pci_io,
+				     EfiPciIoAttributeOperationSupported,
+				     0, &supported );
+	if ( EFI_ERROR ( efirc ) ) {
+		rc = -EEFI ( efirc );
+		return rc;
+	}
+
+	/* Enable DAC if supported */
+	if ( supported & EFI_PCI_IO_ATTRIBUTE_DUAL_ADDRESS_CYCLE ) {
+		
+		efirc = pci_io->Attributes ( pci_io,
+					     EfiPciIoAttributeOperationEnable,
+					     EFI_PCI_IO_ATTRIBUTE_DUAL_ADDRESS_CYCLE,
+					     NULL );
+		if ( EFI_ERROR ( efirc ) ) {
+			rc = -EEFI ( efirc );
+			return rc;
+		}
+		
+		/* Query current attributes to verify DAC was enabled */
+		UINT64 current = 0;
+		efirc = pci_io->Attributes ( pci_io,
+					     EfiPciIoAttributeOperationGet,
+					     0, &current );
+	} else {
+		DBGC ( rtl, "RTL %p DAC is not supported by this device\n", rtl );
+	}
+
+	return 0;
+}
 
 /**
  * Probe PCI device
@@ -1144,7 +1225,34 @@ static int realtek_probe ( struct pci_device *pci ) {
 		goto err_reset;
 
 	/* Detect device type */
-	realtek_detect ( rtl );
+	realtek_detect ( rtl, pci );
+
+	/* Enable DAC if supported (before any DMA operations) */
+#ifdef PCIAPI_EFI
+	/* Check if this is an EFI PCI device by trying to get EFI PCI info */
+	{
+		struct efi_pci_device efipci;
+		if ( pci->dev.parent && pci->dev.parent->desc.bus_type == BUS_TYPE_EFI ) {
+			/* Get the EFI device from the parent */
+			struct efi_device *efidev = container_of ( pci->dev.parent, struct efi_device, dev );
+			if ( efipci_info ( efidev->device, &efipci ) == 0 ) {
+				if ( ( rc = realtek_enable_dac_if_supported ( rtl, efipci.io ) ) != 0 ) {
+					DBGC ( rtl, "RTL %p could not enable DAC: %s (rc=%d)\n", rtl, strerror ( rc ), rc );
+					DBGC ( rtl, "RTL %p continuing without DAC - may limit DMA to 32-bit addresses\n", rtl );
+					/* Continue anyway - DAC is optional */
+				} else {
+					DBGC ( rtl, "RTL %p DAC configuration completed successfully\n", rtl );
+				}
+			} else {
+				DBGC ( rtl, "RTL %p could not get EFI PCI info, skipping DAC configuration\n", rtl );
+			}
+		} else {
+			DBGC ( rtl, "RTL %p not running under EFI (parent bus type is not EFI), skipping DAC configuration\n", rtl );
+		}
+	}
+#else
+	DBGC ( rtl, "RTL %p EFI support not compiled in, skipping DAC configuration\n", rtl );
+#endif /* PCIAPI_EFI */
 
 	/* Initialise EEPROM */
 	if ( rtl->eeprom.bus &&
@@ -1187,6 +1295,8 @@ static int realtek_probe ( struct pci_device *pci ) {
 					   netdev_settings ( netdev ) ) ) != 0)
 			goto err_register_nvo;
 	}
+
+	DBGC ( rtl, "REALTEK %p probe completed successfully\n", rtl );
 
 	return 0;
 
@@ -1237,6 +1347,7 @@ static struct pci_device_id realtek_nics[] = {
 	PCI_ROM ( 0x021b, 0x8139, "hne300",	"Compaq HNE-300", 0 ),
 	PCI_ROM ( 0x02ac, 0x1012, "s1012",	"SpeedStream 1012", 0 ),
 	PCI_ROM ( 0x0357, 0x000a, "ttpmon",	"TTTech TTP-Monitoring", 0 ),
+	PCI_ROM ( 0x10ec, 0x8125, "rtl8125",	"RTL-8125", 0 ),
 	PCI_ROM ( 0x10ec, 0x8129, "rtl8129",	"RTL-8129", 0 ),
 	PCI_ROM ( 0x10ec, 0x8136, "rtl8136",	"RTL8101E/RTL8102E", 0 ),
 	PCI_ROM ( 0x10ec, 0x8138, "rtl8138",	"RT8139 (B/C)", 0 ),
