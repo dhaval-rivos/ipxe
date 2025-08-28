@@ -36,10 +36,10 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 
 #define	NET_PROTO_IPV4		/* IPv4 protocol */
 //#define NET_PROTO_IPV6	/* IPv6 protocol */
-#undef	NET_PROTO_FCOE		/* Fibre Channel over Ethernet protocol */
-#define	NET_PROTO_STP		/* Spanning Tree protocol */
-#define	NET_PROTO_LACP		/* Link Aggregation control protocol */
-#define	NET_PROTO_EAPOL		/* EAP over LAN protocol */
+//#undef	NET_PROTO_FCOE		/* Fibre Channel over Ethernet protocol */
+//#define	NET_PROTO_STP		/* Spanning Tree protocol */
+//#define	NET_PROTO_LACP		/* Link Aggregation control protocol */
+//#define	NET_PROTO_EAPOL		/* EAP over LAN protocol */
 //#define NET_PROTO_LLDP	/* Link Layer Discovery protocol */
 
 /*
@@ -54,11 +54,11 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
  *
  */
 
-#define	DOWNLOAD_PROTO_TFTP	/* Trivial File Transfer Protocol */
-#define	DOWNLOAD_PROTO_HTTP	/* Hypertext Transfer Protocol */
-#undef	DOWNLOAD_PROTO_HTTPS	/* Secure Hypertext Transfer Protocol */
+// #define	DOWNLOAD_PROTO_TFTP	/* Trivial File Transfer Protocol */
+// #define	DOWNLOAD_PROTO_HTTP	/* Hypertext Transfer Protocol */
+// #undef	DOWNLOAD_PROTO_HTTPS	/* Secure Hypertext Transfer Protocol */
 #undef	DOWNLOAD_PROTO_FTP	/* File Transfer Protocol */
-#undef	DOWNLOAD_PROTO_SLAM	/* Scalable Local Area Multicast */
+//#undef	DOWNLOAD_PROTO_SLAM	/* Scalable Local Area Multicast */
 #define	DOWNLOAD_PROTO_NFS	/* Network File System Protocol */
 //#undef DOWNLOAD_PROTO_FILE	/* Local filesystem access */
 
@@ -77,8 +77,8 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
  * HTTP extensions
  *
  */
-#define HTTP_AUTH_BASIC		/* Basic authentication */
-#define HTTP_AUTH_DIGEST	/* Digest authentication */
+// #define HTTP_AUTH_BASIC		/* Basic authentication */
+// #define HTTP_AUTH_DIGEST	/* Digest authentication */
 //#define HTTP_AUTH_NTLM	/* NTLM authentication */
 //#define HTTP_ENC_PEERDIST	/* PeerDist content encoding */
 //#define HTTP_HACK_GCE		/* Google Compute Engine hacks */
@@ -87,15 +87,15 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
  * 802.11 cryptosystems and handshaking protocols
  *
  */
-#define	CRYPTO_80211_WEP	/* WEP encryption (deprecated and insecure!) */
-#define	CRYPTO_80211_WPA	/* WPA Personal, authenticating with passphrase */
-#define	CRYPTO_80211_WPA2	/* Add support for stronger WPA cryptography */
+// #define	CRYPTO_80211_WEP	/* WEP encryption (deprecated and insecure!) */
+// #define	CRYPTO_80211_WPA	/* WPA Personal, authenticating with passphrase */
+// #define	CRYPTO_80211_WPA2	/* Add support for stronger WPA cryptography */
 
 /*
  * 802.1x EAP authentication methods
  *
  */
-#define EAP_METHOD_MD5		/* MD5-Challenge port authentication */
+//#define EAP_METHOD_MD5		/* MD5-Challenge port authentication */
 //#define EAP_METHOD_MSCHAPV2	/* MS-CHAPv2 port authentication */
 
 /*
@@ -103,7 +103,7 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
  *
  */
 
-#define	DNS_RESOLVER		/* DNS resolver */
+//#define	DNS_RESOLVER		/* DNS resolver */
 
 /*
  * Image types
@@ -135,12 +135,12 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
  *
  */
 #define	AUTOBOOT_CMD		/* Automatic booting */
-#define	NVO_CMD			/* Non-volatile option storage commands */
+//#define	NVO_CMD			/* Non-volatile option storage commands */
 #define	CONFIG_CMD		/* Option configuration console */
 #define	IFMGMT_CMD		/* Interface management commands */
-#define	IWMGMT_CMD		/* Wireless interface management commands */
-#define IBMGMT_CMD		/* Infiniband management commands */
-#define FCMGMT_CMD		/* Fibre Channel management commands */
+// #define	IWMGMT_CMD		/* Wireless interface management commands */
+// #define IBMGMT_CMD		/* Infiniband management commands */
+// #define FCMGMT_CMD		/* Fibre Channel management commands */
 #define	ROUTE_CMD		/* Routing table management commands */
 #define IMAGE_CMD		/* Image management commands */
 #define DHCP_CMD		/* DHCP management commands */
@@ -192,7 +192,7 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
  * Virtual network devices
  *
  */
-#define VNIC_IPOIB		/* Infiniband IPoIB virtual NICs */
+//#define VNIC_IPOIB		/* Infiniband IPoIB virtual NICs */
 //#define VNIC_XSIGO		/* Infiniband Xsigo virtual NICs */
 
 /*
@@ -219,9 +219,9 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 #undef	GDBUDP			/* Remote GDB debugging over UDP
 				 * (both may be set) */
 //#define EFI_DOWNGRADE_UX	/* Downgrade UEFI user experience */
-#define	TIVOLI_VMM_WORKAROUND	/* Work around the Tivoli VMM's garbling of SSE
-				 * registers when iPXE traps to it due to
-				 * privileged instructions */
+//#define	TIVOLI_VMM_WORKAROUND	/* Work around the Tivoli VMM's garbling of SSE
+				 //* registers when iPXE traps to it due to
+				 //* privileged instructions */
 
 #include <config/named.h>
 #include NAMED_CONFIG(general.h)
